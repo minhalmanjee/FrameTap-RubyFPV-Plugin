@@ -1,0 +1,240 @@
+
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <pthread.h>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+}
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
+#include "../public/ruby_core_plugin.h"
+
+using namespace std;
+
+#define OUTPUT_DIR        "frametap_frames"
+#define LOG_PATH          "frametap_frames/log.json"
+#define SAVE_EVERY_N      12
+#define UDP_PORT          7012
+
+const char* g_szPluginName = "FrameTap - RubyFPV Frame Extractor";
+const char* g_szPluginGUID = "FT9921-RFP44-XT01-FRAME";
+
+static int            g_iFrameCount    = 0;
+static int            g_iSavedCount    = 0;
+static bool           g_bFirstIFrame   = false;
+static FILE*          g_pLog           = NULL;
+static bool           g_bFirstLog      = true;
+
+static AVCodec*        g_pCodec        = NULL;
+static AVCodecContext* g_pCodecCtx     = NULL;
+static AVPacket*       g_pPkt          = NULL;
+static AVFrame*        g_pFrame        = NULL;
+static AVFrame*        g_pRGBFrame     = NULL;
+static SwsContext*     g_pSwsCtx       = NULL;
+
+static int             g_iSock         = -1;
+static pthread_t       g_thread;
+static bool            g_bRunning      = false;
+static uint8_t         g_uBuffer[65536];
+
+void ft_mkdir(const char* path) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", path);
+    system(cmd);
+}
+
+void ft_log(int frame_id, const char* type, int w, int h, int64_t ts) {
+    if (!g_pLog) return;
+    if (!g_bFirstLog) fprintf(g_pLog, ",\n");
+    fprintf(g_pLog,
+        "  {\n"
+        "    \"frame_id\": %d,\n"
+        "    \"timestamp\": %lld,\n"
+        "    \"frame_type\": \"%s\",\n"
+        "    \"width\": %d,\n"
+        "    \"height\": %d\n"
+        "  }",
+        frame_id, (long long)ts, type, w, h);
+    fflush(g_pLog);
+    g_bFirstLog = false;
+    printf("[frametap] frame %d | %s | %dx%d\n", frame_id, type, w, h);
+}
+
+bool ft_init_decoder() {
+    g_pCodec = (AVCodec*)avcodec_find_decoder(AV_CODEC_ID_H264);
+    if (!g_pCodec) { printf("[frametap] H264 codec not found\n"); return false; }
+
+    g_pCodecCtx = avcodec_alloc_context3(g_pCodec);
+    g_pCodecCtx->flags2 |= AV_CODEC_FLAG2_FAST;
+
+    if (avcodec_open2(g_pCodecCtx, g_pCodec, NULL) < 0) {
+        printf("[frametap] failed to open codec\n");
+        return false;
+    }
+
+    g_pPkt      = av_packet_alloc();
+    g_pFrame    = av_frame_alloc();
+    g_pRGBFrame = av_frame_alloc();
+    printf("[frametap] decoder initialized\n");
+    return true;
+}
+
+void ft_save_frame(bool is_iframe) {
+    if (!g_pSwsCtx) {
+        g_pSwsCtx = sws_getContext(
+            g_pFrame->width, g_pFrame->height, (AVPixelFormat)g_pFrame->format,
+            g_pFrame->width, g_pFrame->height, AV_PIX_FMT_RGB24,
+            SWS_BILINEAR, NULL, NULL, NULL);
+        av_image_alloc(g_pRGBFrame->data, g_pRGBFrame->linesize,
+            g_pFrame->width, g_pFrame->height, AV_PIX_FMT_RGB24, 1);
+    }
+
+    sws_scale(g_pSwsCtx, g_pFrame->data, g_pFrame->linesize,
+        0, g_pFrame->height, g_pRGBFrame->data, g_pRGBFrame->linesize);
+
+    time_t t = time(NULL);
+    struct tm* tm_info = localtime(&t);
+    char timebuf[32];
+    strftime(timebuf, sizeof(timebuf), "%Y%m%d_%H%M%S", tm_info);
+
+    char fname[256];
+    snprintf(fname, sizeof(fname), "%s/frame_%05d_%s_%s.jpg",
+        OUTPUT_DIR, g_iSavedCount, timebuf, is_iframe ? "I" : "P");
+
+    stbi_write_jpg(fname, g_pFrame->width, g_pFrame->height, 3,
+        g_pRGBFrame->data[0], 90);
+
+    int64_t ts = (int64_t)time(NULL) * 1000;
+    ft_log(g_iSavedCount, is_iframe ? "I-frame" : "P-frame",
+        g_pFrame->width, g_pFrame->height, ts);
+
+    g_iSavedCount++;
+}
+
+void ft_process_data(uint8_t* pData, int iLen) {
+    // Detect I-frame via NAL type 5
+    bool is_iframe = false;
+    for (int i = 0; i < iLen - 4; i++) {
+        if (pData[i]==0 && pData[i+1]==0 && pData[i+2]==0 && pData[i+3]==1) {
+            uint8_t nal_type = pData[i+4] & 0x1F;
+            if (nal_type == 5) { is_iframe = true; g_bFirstIFrame = true; break; }
+        }
+    }
+
+    if (!g_bFirstIFrame) return;
+
+    g_iFrameCount++;
+    if (g_iFrameCount % SAVE_EVERY_N != 0) return;
+
+    g_pPkt->data = pData;
+    g_pPkt->size = iLen;
+    if (g_pPkt->size == 0) return;
+
+    if (avcodec_send_packet(g_pCodecCtx, g_pPkt) < 0) return;
+    if (avcodec_receive_frame(g_pCodecCtx, g_pFrame) < 0) return;
+
+    ft_save_frame(is_iframe);
+}
+
+void* ft_udp_thread(void*) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(UDP_PORT);
+
+    g_iSock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_iSock < 0) { printf("[frametap] socket failed\n"); return NULL; }
+    if (bind(g_iSock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        printf("[frametap] bind failed on port %d\n", UDP_PORT);
+        return NULL;
+    }
+
+    printf("[frametap] listening on UDP port %d\n", UDP_PORT);
+
+    while (g_bRunning) {
+        int iRecv = recv(g_iSock, g_uBuffer, sizeof(g_uBuffer), 0);
+        if (iRecv <= 0) continue;
+        ft_process_data(g_uBuffer, iRecv);
+    }
+
+    close(g_iSock);
+    return NULL;
+}
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+u32 core_plugin_on_requested_capabilities() {
+    return CORE_PLUGIN_CAPABILITY_VIDEO_STREAM | CORE_PLUGIN_CAPABILITY_DATA_STREAM;
+}
+
+const char* core_plugin_get_name() { return g_szPluginName; }
+const char* core_plugin_get_guid() { return g_szPluginGUID; }
+int core_plugin_get_version()      { return 1; }
+
+int core_plugin_init(u32 uRuntimeLocation, u32 uAllocatedCapabilities) {
+    ft_mkdir(OUTPUT_DIR);
+    g_pLog = fopen(LOG_PATH, "w");
+    if (g_pLog) fprintf(g_pLog, "[\n");
+
+    if (!ft_init_decoder()) return -1;
+
+    g_bRunning = true;
+    pthread_create(&g_thread, NULL, ft_udp_thread, NULL);
+    printf("[frametap] plugin initialized — saving every %d frames to %s\n",
+        SAVE_EVERY_N, OUTPUT_DIR);
+    return 0;
+}
+
+void core_plugin_uninit() {
+    g_bRunning = false;
+    if (g_iSock >= 0) close(g_iSock);
+    pthread_join(g_thread, NULL);
+
+    if (g_pLog) { fprintf(g_pLog, "\n]"); fclose(g_pLog); }
+    if (g_pSwsCtx)   sws_freeContext(g_pSwsCtx);
+    if (g_pRGBFrame) av_frame_free(&g_pRGBFrame);
+    if (g_pFrame)    av_frame_free(&g_pFrame);
+    if (g_pPkt)      av_packet_free(&g_pPkt);
+    if (g_pCodecCtx) avcodec_free_context(&g_pCodecCtx);
+    printf("[frametap] plugin unloaded. %d frames saved.\n", g_iSavedCount);
+}
+
+void core_plugin_on_rx_data(u8* pData, int iDataLength, int iDataType, u32 uSegmentIndex) {
+    if (iDataType == CORE_PLUGIN_TYPE_VIDEO_SEGMENT)
+        ft_process_data(pData, iDataLength);
+}
+
+u32  core_plugin_has_pending_tx_data()                              { return 0; }
+u8*  core_plugin_on_get_segment_data(u32 uSegmentIndex)             { return NULL; }
+int  core_plugin_on_get_segment_length(u32 uSegmentIndex)           { return 0; }
+int  core_plugin_on_get_segment_type(u32 uSegmentIndex)             { return CORE_PLUGIN_TYPE_DATA_SEGMENT; }
+int  core_plugin_on_get_video_stream_source_type()                  { return CORE_PLUGIN_VIDEO_STREAM_SOURCE_IP; }
+int  core_plugin_on_setup_video_stream_source()                     { return 1; }
+void core_plugin_on_start_video_stream_capture(int w, int h, int f) {}
+void core_plugin_on_stop_video_stream_capture()                     {}
+void core_plugin_on_start_video_stream_playback(int x, int y, int w, int h) {}
+void core_plugin_on_stop_video_stream_playback()                    {}
+void core_plugin_on_lower_video_capture_rate(int iMaxkbps)          {}
+void core_plugin_on_higher_video_capture_rate(int iMaxkbps)         {}
+void core_plugin_on_allocated_uart(char* szUARTName)                {}
+void core_plugin_on_stop_using_uart()                               {}
+
+#ifdef __cplusplus
+}
+#endif
